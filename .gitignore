@@ -1,0 +1,38 @@
+﻿# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Generated data (large, can be regenerated)
+data/landing/
+data/raw/
+data/rejected/
+data/processed/
+data/analytics/
+data/pipeline_output/
+data/pipeline_output_test/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
