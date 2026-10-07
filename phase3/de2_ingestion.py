@@ -24,11 +24,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ingestion")
 
-LANDING_DIR = "../data/landing"
-RAW_DIR = "../data/raw"
-REJECTED_DIR = "../data/rejected"
-LOG_DIR = "../logs"
+LANDING_DIR = "/home/mirrag/project_data/data/landing"
+RAW_DIR = "/home/mirrag/project_data/data/raw"
+REJECTED_DIR = "/home/mirrag/project_data/data/rejected"
+LOG_DIR = "/home/mirrag/project_data/logs"
 INGESTION_LOG_PATH = os.path.join(LOG_DIR, "ingestion_log.csv")
+
+# NOTE: these are absolute paths into native WSL storage, not relative
+# paths under this script's own directory. DrvFs (WSL's bridge to
+# Windows drives, e.g. /mnt/d/...) is unreliable for the sustained,
+# repeated I/O this pipeline does -- confirmed twice via intermittent
+# "Cannot allocate memory" crashes deep inside both Python's own file
+# reads and Spark/Hadoop's local file reads. Source .py files stay on
+# D:\ (edited from Windows as normal); only the data/logs directories
+# that take heavy I/O moved to native storage.
 
 EXPECTED_COLUMNS = [
     "datetime", "CellID", "countrycode",
@@ -77,16 +86,33 @@ def validate_schema(filepath):
 # =====================================================================
 def validate_minimum_quality(filepath):
     """Row-level spot checks: malformed timestamps, negative activity
-    values. Does not require every row to be checked exhaustively —
-    reads the file once and flags the first disqualifying issue found,
-    plus a row count. Returns (is_valid, reason_or_none, row_count)."""
+    values, and truncated/malformed rows (wrong field count). Does not
+    require every row to be checked exhaustively — reads the file once
+    and flags the first disqualifying issue found, plus a row count.
+    Returns (is_valid, reason_or_none, row_count)."""
     row_count = 0
     activity_cols = ["smsin", "smsout", "callin", "callout", "internet"]
+    expected_field_count = len(EXPECTED_COLUMNS)
 
     with open(filepath, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for line_num, row in enumerate(reader, start=2):  # start=2: line 1 is header
+        reader = csv.reader(f)
+        next(reader)  # skip header, already validated by validate_schema()
+        for line_num, raw_row in enumerate(reader, start=2):  # start=2: line 1 is header
             row_count += 1
+
+            # DE8 fix: csv.DictReader silently pads short rows with
+            # None for missing trailing fields, which then looked
+            # indistinguishable from a legitimately null activity
+            # value -- this let a truncated/corrupt row through as
+            # ACCEPTED. Checking the raw field count explicitly catches
+            # truncation before it can be mistaken for a null.
+            if len(raw_row) != expected_field_count:
+                return (False,
+                        f"truncated_or_malformed_row at line {line_num}: "
+                        f"expected {expected_field_count} fields, got {len(raw_row)}",
+                        row_count)
+
+            row = dict(zip(EXPECTED_COLUMNS, raw_row))
 
             ts_raw = row.get("datetime", "")
             try:
@@ -109,6 +135,22 @@ def validate_minimum_quality(filepath):
 
 
 # =====================================================================
+def is_duplicate_ingestion(filename):
+    """Check ingestion_log.csv for a prior ACCEPTED entry for this exact
+    filename. Returns True if this file has already been successfully
+    ingested before -- a re-dropped file under the same name is a
+    duplicate-ingestion attempt (WARN), not a fresh arrival."""
+    if not os.path.exists(INGESTION_LOG_PATH):
+        return False
+    with open(INGESTION_LOG_PATH, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("filename") == filename and row.get("status") == "ACCEPTED":
+                return True
+    return False
+
+
+# =====================================================================
 def route_file(filepath, is_valid, reason, row_count):
     """Copy (not move-then-verify-later) the file to raw/ or rejected/,
     preserving the original filename. The landing/ copy is left in
@@ -123,8 +165,24 @@ def route_file(filepath, is_valid, reason, row_count):
 
     # Verify byte-for-byte the destination matches the source —
     # required per Learner Validation: "raw files preserved unchanged"
+    #
+    # Compare in chunks rather than f1.read() == f2.read(). Reading an
+    # entire ~240MB file in one call is exactly the I/O pattern that
+    # triggers DrvFs's intermittent "Cannot allocate memory" error when
+    # source/dest live under a Windows-drive mount (/mnt/d/...); chunked
+    # reads verify the same bytes without ever holding a huge buffer or
+    # issuing one giant read() syscall.
+    CHUNK_SIZE = 4 * 1024 * 1024  # 4MB
+    identical = True
     with open(filepath, "rb") as f1, open(dest_path, "rb") as f2:
-        identical = f1.read() == f2.read()
+        while True:
+            chunk1 = f1.read(CHUNK_SIZE)
+            chunk2 = f2.read(CHUNK_SIZE)
+            if chunk1 != chunk2:
+                identical = False
+                break
+            if not chunk1:  # both exhausted at the same point
+                break
 
     logger.info(
         "route_file(): %s -> %s (identical_bytes=%s)",
@@ -154,10 +212,25 @@ def write_ingestion_log(filename, status, row_count, reason, processed_at):
 
 # =====================================================================
 def process_one_file(filepath):
-    """Full pipeline for a single file: validate schema, validate
-    quality, route, log. Returns a summary dict."""
+    """Full pipeline for a single file: check for duplicate ingestion,
+    validate schema, validate quality, route, log. Returns a summary dict."""
     filename = os.path.basename(filepath)
     processed_at = datetime.now().isoformat()
+
+    # DE8 control #1: duplicate ingestion detection (WARN, not
+    # REJECT/FAIL). A file we've already successfully accepted, showing
+    # up again under the same name, isn't dangerous to reprocess (the
+    # copy is idempotent) but IS worth flagging -- it usually means an
+    # operator mistake (wrong file re-dropped) rather than a fresh
+    # day's data. We skip re-copying/re-logging as a fresh ACCEPTED
+    # entry and instead log a distinguishable DUPLICATE status.
+    if is_duplicate_ingestion(filename):
+        logger.warning("process_one_file(): %s already ACCEPTED previously -- "
+                        "DUPLICATE ingestion attempt, skipping reprocessing", filename)
+        write_ingestion_log(filename, "DUPLICATE", 0,
+                             "already_accepted_previously", processed_at)
+        return {"filename": filename, "status": "DUPLICATE",
+                "reason": "already_accepted_previously"}
 
     schema_ok, schema_reason = validate_schema(filepath)
     if not schema_ok:

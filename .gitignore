@@ -23,6 +23,13 @@ data/analytics/
 data/pipeline_output/
 data/pipeline_output_test/
 
+# Raw datasets and warehouse (too large for GitHub)
+data/*.csv
+data/unused/
+data/warehouse/
+*.db
+*.sqlite
+
 # Logs
 logs/
 *.log
@@ -36,3 +43,10 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Raw datasets and warehouse (too large for GitHub)
+data/*.csv
+data/unused/
+data/warehouse/
+*.db
+*.sqlite

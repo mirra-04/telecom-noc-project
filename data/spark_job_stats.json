@@ -1,0 +1,21 @@
+{
+  "job": "telecom_pipeline",
+  "status": "SUCCESS",
+  "job_start": "2026-09-05T12:50:40.703417",
+  "job_end": "2026-09-05T12:59:15.640433",
+  "elapsed_seconds": 514.92,
+  "input_row_count": 15089165,
+  "accepted_count": 15089165,
+  "rejected_count": 0,
+  "null_counts": {
+    "sms_in": 9065620,
+    "sms_out": 11542655,
+    "call_in": 10979856,
+    "call_out": 8604862,
+    "internet_activity": 8369201
+  },
+  "nulls_handled_total": 48562194,
+  "processed_rows": 15089165,
+  "analytics_rows": 1679994,
+  "dashboard_rows": 7
+}

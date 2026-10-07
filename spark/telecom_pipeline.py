@@ -20,6 +20,16 @@ Outputs (all written under --output-dir):
     processed/activity/date=YYYY-MM-DD/part-0.parquet   (one folder per date)
     analytics/hourly_grid_summary/part-0.parquet          (one row per grid+hour)
     dashboard_summary.csv                                  (one row per date)
+    spark_job_stats.json   (DE7 addition — see below)
+
+DE7 addition (machine-readable job stats):
+    Everything in this file's JOB STATUS: SUCCESS log block was already
+    being computed (clean_stats, output_stats, input_row_count, elapsed)
+    but only ever logged as text. DE7's quality_check task needs these
+    numbers programmatically, so on a SUCCESSFUL run this job now also
+    writes spark_job_stats.json to --output-dir containing exactly the
+    same numbers the log block already reports. No new computation was
+    added — this only persists what the job already knew.
 
 Failure conditions (job exits non-zero and logs an ERROR):
     - --input-dir contains zero matching CSV files
@@ -336,8 +346,18 @@ def main():
     spark = (
         SparkSession.builder
         .appName("TelecomPipeline")
-        .config("spark.driver.memory", "4g")
-        .config("spark.sql.shuffle.partitions", "8")
+        .config("spark.driver.memory", "2g")
+        .config("spark.sql.shuffle.partitions", "4")
+        # DrvFs (WSL's bridge to Windows drives, e.g. /mnt/d/...) fails
+        # intermittently with "Cannot allocate memory" under Hadoop's
+        # default ChecksumFileSystem wrapper, which does many small
+        # tight reads per file to verify CRCs on every read. Since this
+        # project's source files never travel over a network filesystem
+        # that would actually need that integrity check, bypassing the
+        # checksum wrapper for local reads removes the exact I/O pattern
+        # that was crashing -- Spark still reads the file correctly, just
+        # without Hadoop's extra checksum layer on top.
+        .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.RawLocalFileSystem")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -370,6 +390,32 @@ def main():
         logger.info("Elapsed time: %.2fs", elapsed)
         logger.info("JOB END: %s", datetime.now().isoformat())
         logger.info("=" * 60)
+
+        # ---- DE7 addition: persist the same numbers as machine-readable JSON ----
+        # Nothing here is newly computed -- accepted_count/rejected_count/null_counts
+        # come from clean_stats (already built in clean()), processed/analytics row
+        # counts come from output_stats (already built in write_outputs()). This is
+        # purely a write of existing values, so quality_check_task in de7_dag.py can
+        # read structured numbers instead of scraping this job's text log.
+        stats_payload = {
+            "job": "telecom_pipeline",
+            "status": "SUCCESS",
+            "job_start": datetime.fromtimestamp(job_start).isoformat(),
+            "job_end": datetime.now().isoformat(),
+            "elapsed_seconds": round(elapsed, 2),
+            "input_row_count": input_row_count,
+            "accepted_count": clean_stats["accepted_count"],
+            "rejected_count": clean_stats["rejected_count"],
+            "null_counts": clean_stats["null_counts"],
+            "nulls_handled_total": sum(clean_stats["null_counts"].values()),
+            "processed_rows": output_stats["processed_rows"],
+            "analytics_rows": output_stats["analytics_rows"],
+            "dashboard_rows": output_stats["dashboard_rows"],
+        }
+        stats_path = os.path.join(args.output_dir, "spark_job_stats.json")
+        with open(stats_path, "w", encoding="utf-8") as f:
+            json.dump(stats_payload, f, indent=2)
+        logger.info("Wrote machine-readable job stats to %s", stats_path)
 
     except Exception as e:
         elapsed = time.time() - job_start
